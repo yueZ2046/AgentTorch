@@ -93,7 +93,7 @@ for epi in range(num_episodes):
 ```
 
 ## License
-Copyright (c) 2023-2025 Ayush Chopra
+Copyright (c) Ayush Chopra
 
 This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). This means:
 - You can freely use, modify, and distribute this software
@@ -102,7 +102,7 @@ This project is licensed under the GNU Affero General Public License v3.0 (AGPL-
 - You must give appropriate credit and indicate any changes made
 - For full terms, see [LICENSE.md](LICENSE.md) file in this repository
 
-For inquiries about using this software in a proprietary product, please reach out to request a license wavier.
+For inquiries about using this software in a proprietary product, please reach out to request a commercial license.
 
 ## Guides and Tutorials
 
