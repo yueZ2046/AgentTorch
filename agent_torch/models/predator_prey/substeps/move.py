@@ -87,7 +87,7 @@ class DecideMovement(SubstepAction):
         next_positions = []
         for idx, pos in enumerate(positions):
             next_positions.append(
-                random.choice(possible_neighbors[idx]) if energy[idx] > 0 else pos
+                random.choice(possible_neighbors[idx]) if (energy[idx] > 0 and len(possible_neighbors[idx]) > 0) else pos
             )
 
         return {self.output_variables[0]: torch.stack(next_positions, dim=0)}
