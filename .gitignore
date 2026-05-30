@@ -30,3 +30,7 @@ cache/
 dist/
 
 *.parquet
+
+# Raw data — never commit to GitHub
+data_shenzhen/
+outputs/
