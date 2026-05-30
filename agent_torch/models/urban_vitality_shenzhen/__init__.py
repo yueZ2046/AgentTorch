@@ -24,12 +24,16 @@ def create_runner(
     validation_fraction: float = 0.2,
     seed: int = 42,
     device: str = "auto",
+    split_strategy: str = "random",
+    holdout_district=None,
 ):
     """Load Shenzhen data and return an initialized AgentTorch runner."""
     dataset = load_shenzhen_vitality_data(
         data_dir=data_dir,
         validation_fraction=validation_fraction,
         seed=seed,
+        split_strategy=split_strategy,
+        holdout_district=holdout_district,
     )
     config = build_config(dataset, hidden_dim=hidden_dim, device=device)
     runner = Runner(config, get_registry())
