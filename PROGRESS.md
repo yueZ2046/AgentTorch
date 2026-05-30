@@ -165,7 +165,7 @@ python3.12 -m pytest tests/test_urban_vitality_shenzhen.py -v
 - SSH config：`~/.ssh/config` 已配置，直接可用
 
 ```bash
-git push github master
+git push github master:main
 ```
 
 > `data_shenzhen/` 和 `outputs/` 已在 `.gitignore` 中，永远不会上传。
