@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
+import warnings
 import pandas as pd
 import torch
 
@@ -23,13 +24,27 @@ N_DEMO_GROUPS = len(DEMO_GROUPS)
 PORTRAIT_FILE = "街坊_人口画像.csv"
 SHP_FILE      = "街坊范围shp/深圳_街坊_Pro.shp"
 
-POI_DIR = "POI原始数据202601"
+POI_DIR = "POI2026/POI_SHP"
 # Ordered by coverage / predictive relevance; poi_road excluded (99% zero, 189 total POIs).
 POI_CATEGORIES = {
     "poi_medical":    "深圳市-医疗保健服务.shp",   # 26369 POIs — dense, good signal
     "poi_scenic":     "深圳市-风景名胜.shp",        # 5875 POIs — leisure destinations
     "poi_auto_sales": "深圳市-汽车销售.shp",        # 4297 POIs — commercial proxy
     "poi_motorcycle": "深圳市-摩托车服务.shp",      # 764 POIs — local mobility proxy
+}
+
+# 2026 POI update: CSV files include wgslng/wgslat (WGS84) coordinates.
+# Categories aligned with Shenzhen vitality study activity dimensions.
+POI_DIR_2026 = "POI2026/POI_CSV"
+POI_CATEGORIES_2026 = {
+    "poi_restaurant": "深圳市-餐饮服务.csv",         # 108 953 — dining, highest vitality driver
+    "poi_shopping":   "深圳市-购物服务.csv",          # 162 881 — retail, daytime attractor
+    "poi_life_svc":   "深圳市-生活服务.csv",          # 101 544 — everyday services
+    "poi_transport":  "深圳市-交通设施服务.csv",      # 53 020 — transit hubs, accessibility
+    "poi_company":    "深圳市-公司企业.csv",           # 130 706 — employment, weekday flow
+    "poi_sports":     "深圳市-体育休闲服务.csv",      # 24 409 — leisure, weekend flow
+    "poi_hotel":      "深圳市-住宿服务.csv",           # 21 244 — accommodation, overnight activity
+    "poi_education":  "深圳市-科教文化服务.csv",      # 24 709 — cultural and educational
 }
 
 # Curated columns from 街坊_人口画像.csv ordered by predictive value.
@@ -67,6 +82,7 @@ class ShenzhenVitalityDataset:
     target_scale: torch.Tensor
     edge_index: Optional[torch.Tensor] = field(default=None)           # (2, E) Neighbor80 proximity
     edge_index_mobility: Optional[torch.Tensor] = field(default=None)  # (2, E) k-NN commute graph
+    districts: Optional[np.ndarray] = field(default=None)              # (N_blocks,) str — admin district per block
 
     @property
     def num_blocks(self) -> int:
@@ -103,6 +119,72 @@ def _training_masks(num_blocks: int, validation_fraction: float, seed: int):
     validation_mask = torch.zeros(num_blocks, dtype=torch.bool)
     validation_mask[order[:validation_size]] = True
     return ~validation_mask, validation_mask
+
+
+def _load_block_districts(
+    data_dir: Path, block_id_order: np.ndarray
+) -> Optional[np.ndarray]:
+    """Assign each block a Shenzhen administrative district label via spatial join.
+
+    Uses block centroids joined to the OD departure grid (which carries district
+    and street labels).  Returns a string array aligned with block_id_order,
+    or None when geopandas / the OD shapefile is unavailable.
+    """
+    od_path  = data_dir / "LBS原始数据/工作日出发人口_网格.shp"
+    shp_path = data_dir / SHP_FILE
+    if not od_path.exists() or not shp_path.exists():
+        return None
+    try:
+        import geopandas as gpd
+    except ImportError:
+        return None
+
+    gdf = gpd.read_file(shp_path)
+    gdf["Block_ID"] = _canonical_block_id(gdf["Block_ID"])
+    od = gpd.read_file(od_path)[["district", "geometry"]]
+
+    centroids = gdf[["Block_ID", "geometry"]].copy()
+    centroids["geometry"] = centroids.geometry.centroid
+    centroids = centroids.to_crs(od.crs)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        joined = gpd.sjoin(centroids, od[["district", "geometry"]],
+                           how="left", predicate="within")
+
+    # Drop duplicate matches (rare boundary cases) and keep first
+    joined = joined.drop_duplicates(subset=["Block_ID"])
+
+    # Fallback for centroids outside all OD cells (~0.6%)
+    missing_mask = joined["district"].isna()
+    if missing_mask.any():
+        missing_gdf = centroids[missing_mask.values].copy()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            nearest = gpd.sjoin_nearest(missing_gdf, od[["district", "geometry"]],
+                                        how="left")
+        nearest = nearest.drop_duplicates(subset=["Block_ID"])
+        joined.loc[missing_mask, "district"] = nearest["district"].values
+
+    id_to_district = dict(
+        zip(joined["Block_ID"].astype("int64"), joined["district"].fillna("unknown"))
+    )
+    return np.array([id_to_district.get(int(bid), "unknown") for bid in block_id_order])
+
+
+def _district_masks(
+    districts: np.ndarray, holdout: str
+):
+    """Return (train_mask, val_mask) where validation = blocks in `holdout` district."""
+    available = sorted(set(districts))
+    if holdout not in available:
+        raise ValueError(
+            f"District '{holdout}' not found. Available: {available}"
+        )
+    val_mask = torch.tensor(districts == holdout, dtype=torch.bool)
+    if val_mask.all():
+        raise ValueError(f"All blocks belong to district '{holdout}'; cannot train.")
+    return ~val_mask, val_mask
 
 
 def _build_knn_mobility_edges(
@@ -202,6 +284,59 @@ def _build_spatial_edges(
     return edge_index
 
 
+def _count_poi_per_block_csv(data_dir: Path) -> Optional[pd.DataFrame]:
+    """Count POIs per block from 2026 CSV files using wgslng/wgslat coordinates.
+
+    CSV files carry WGS84 (EPSG:4326) lon/lat; blocks are in EPSG:3857.
+    Points are reprojected before spatial join.
+    Returns a DataFrame [Block_ID, poi_restaurant, ...] or None on failure.
+    """
+    poi_dir = data_dir / POI_DIR_2026
+    shp_path = data_dir / SHP_FILE
+    if not poi_dir.exists() or not shp_path.exists():
+        return None
+    try:
+        import geopandas as gpd
+    except ImportError:
+        return None
+
+    blocks = gpd.read_file(shp_path)
+    blocks["Block_ID"] = _canonical_block_id(blocks["Block_ID"])
+    all_block_ids = blocks["Block_ID"].unique()
+
+    col_frames = {}
+    for col_name, filename in POI_CATEGORIES_2026.items():
+        fp = poi_dir / filename
+        if not fp.exists():
+            continue
+        try:
+            df = pd.read_csv(fp, encoding="utf-8-sig", usecols=["wgslng", "wgslat"])
+            df = df.dropna(subset=["wgslng", "wgslat"])
+            poi = gpd.GeoDataFrame(
+                df,
+                geometry=gpd.points_from_xy(df["wgslng"], df["wgslat"]),
+                crs="EPSG:4326",
+            ).to_crs(blocks.crs)
+            joined = gpd.sjoin(
+                blocks[["Block_ID", "geometry"]],
+                poi[["geometry"]],
+                how="left",
+                predicate="contains",
+            )
+            matched = joined.dropna(subset=["index_right"])
+            counts = matched.groupby("Block_ID").size()
+            counts = counts.reindex(all_block_ids, fill_value=0).rename(col_name)
+            col_frames[col_name] = counts
+        except Exception:
+            continue
+
+    if not col_frames:
+        return None
+    result = pd.DataFrame(col_frames).reset_index()
+    result.rename(columns={"index": "Block_ID"}, inplace=True)
+    return result
+
+
 def _count_poi_per_block(data_dir: Path) -> Optional[pd.DataFrame]:
     """Count POIs per block for each category in POI_CATEGORIES.
 
@@ -253,10 +388,104 @@ def _count_poi_per_block(data_dir: Path) -> Optional[pd.DataFrame]:
     return result
 
 
+_OD_FILES = {
+    "arr_wd": "LBS原始数据/工作日到达人口_网格.shp",
+    "dep_wd": "LBS原始数据/工作日出发人口_网格.shp",
+    "arr_we": "LBS原始数据/周末到达人口_网格.shp",
+    "dep_we": "LBS原始数据/周末出发人口_网格.shp",
+}
+
+
+def _aggregate_od_to_blocks(data_dir: Path) -> Optional[pd.DataFrame]:
+    """Aggregate grid-level arrival/departure flows to block level.
+
+    Spatial-joins ~90k LBS grid centroids to 3023 blocks and sums hourly
+    flow counts per block.  Returns a DataFrame with columns:
+
+        Block_ID,
+        od_arr_wd_h00..h23  (weekday hourly arrivals,   24 cols)
+        od_dep_wd_h00..h23  (weekday hourly departures, 24 cols)
+        od_arr_we_h00..h23  (weekend  hourly arrivals,  24 cols)
+        od_dep_we_h00..h23  (weekend  hourly departures,24 cols)
+
+    Returns None if geopandas is unavailable or the OD files are missing.
+    Blocks without any overlapping grids receive zeros.
+    """
+    shp_path = data_dir / SHP_FILE
+    # Check at least one OD file exists before importing geopandas
+    if not shp_path.exists() or not any(
+        (data_dir / p).exists() for p in _OD_FILES.values()
+    ):
+        return None
+    try:
+        import geopandas as gpd
+    except ImportError:
+        return None
+
+    blocks = gpd.read_file(shp_path)
+    blocks["Block_ID"] = _canonical_block_id(blocks["Block_ID"])
+    all_block_ids = sorted(blocks["Block_ID"].unique())
+
+    # Build grid-to-block mapping once (reused for all four OD layers).
+    # Use the first available OD file to establish the grid index.
+    first_path = next(
+        (data_dir / p for p in _OD_FILES.values() if (data_dir / p).exists()), None
+    )
+    if first_path is None:
+        return None
+
+    ref_gdf = gpd.read_file(first_path, columns=["grid_id", "geometry"])
+    ref_gdf = ref_gdf.to_crs(blocks.crs)
+    ref_gdf["centroid"] = ref_gdf.geometry.centroid
+    centroids = ref_gdf[["grid_id"]].copy()
+    centroids["geometry"] = ref_gdf["centroid"]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mapping = gpd.sjoin(
+            centroids.set_geometry("geometry"),
+            blocks[["Block_ID", "geometry"]],
+            how="inner",
+            predicate="within",
+        )[["grid_id", "Block_ID"]]
+
+    grid_to_block = mapping.set_index("grid_id")["Block_ID"].to_dict()
+
+    result = pd.DataFrame({"Block_ID": all_block_ids}).set_index("Block_ID")
+
+    for tag, rel_path in _OD_FILES.items():
+        fp = data_dir / rel_path
+        if not fp.exists():
+            continue
+        gdf = gpd.read_file(fp)
+        h_cols = [f"h{h:02d}" for h in range(24)]
+        h_cols_present = [c for c in h_cols if c in gdf.columns]
+        if not h_cols_present:
+            continue
+
+        gdf["Block_ID"] = gdf["grid_id"].map(grid_to_block)
+        gdf_matched = gdf.dropna(subset=["Block_ID"])
+        gdf_matched = gdf_matched.copy()
+        gdf_matched["Block_ID"] = gdf_matched["Block_ID"].astype("int64")
+
+        agg = gdf_matched.groupby("Block_ID")[h_cols_present].sum()
+        for h_col in h_cols_present:
+            out_col = f"od_{tag}_{h_col}"
+            result[out_col] = agg[h_col].reindex(result.index, fill_value=0.0)
+
+    result = result.reset_index()
+    od_cols = [c for c in result.columns if c.startswith("od_")]
+    if not od_cols:
+        return None
+    return result
+
+
 def load_shenzhen_vitality_data(
     data_dir="data_shenzhen",
     validation_fraction: float = 0.2,
     seed: int = 42,
+    split_strategy: str = "random",
+    holdout_district: Optional[str] = None,
 ) -> ShenzhenVitalityDataset:
     """Read block attributes and LBS curves and prepare supervised tensors.
 
@@ -317,6 +546,30 @@ def load_shenzhen_vitality_data(
             numeric_features[col] = np.log1p(numeric_features[col].fillna(0.0))
         feature_names = feature_names + poi_cols
 
+    # Enrich with 2026 POI categories from CSV (餐饮/购物/生活/交通/公司/体育/住宿/科教).
+    poi_csv_df = _count_poi_per_block_csv(data_dir)
+    if poi_csv_df is not None:
+        poi_csv_cols = [c for c in poi_csv_df.columns if c != "Block_ID"]
+        numeric_features = numeric_features.merge(poi_csv_df, on="Block_ID", how="left")
+        for col in poi_csv_cols:
+            numeric_features[col] = np.log1p(numeric_features[col].fillna(0.0))
+        feature_names = feature_names + poi_csv_cols
+
+    # Enrich with aggregated OD flow features (Phase 3).
+    # Each block gets 24-hour arrival + departure profiles for weekday and weekend
+    # (96 features total) derived from the raw LBS grid-level OD data.  These
+    # directly encode each block's empirical temporal activity pattern, giving
+    # scale_net a strong signal it cannot infer from static building/POI features.
+    od_df = _aggregate_od_to_blocks(data_dir)
+    if od_df is not None:
+        od_cols = [c for c in od_df.columns if c != "Block_ID"]
+        numeric_features = numeric_features.merge(od_df, on="Block_ID", how="left")
+        for col in od_cols:
+            numeric_features[col] = np.log1p(numeric_features[col].fillna(0.0))
+        feature_names = feature_names + od_cols
+        print(f"[data] OD features loaded: {len(od_cols)} cols "
+              f"({od_df['Block_ID'].nunique()}/{len(numeric_features)} blocks matched)")
+
     target_frame = target_frame[["Block_ID", *TARGET_NAMES]].drop_duplicates("Block_ID")
     merged = numeric_features.merge(target_frame, on="Block_ID", how="inner", validate="one_to_one")
     if merged.empty:
@@ -340,7 +593,21 @@ def load_shenzhen_vitality_data(
     if target_values.isna().any().any():
         raise ValueError("LBS target columns contain missing or non-numeric values.")
 
-    train_mask, validation_mask = _training_masks(len(merged), validation_fraction, seed)
+    block_id_order = merged["Block_ID"].to_numpy(dtype="int64", copy=True)
+    districts = _load_block_districts(data_dir, block_id_order)
+
+    if split_strategy == "district":
+        if districts is None:
+            raise ValueError(
+                "District data unavailable (LBS原始数据/工作日出发人口_网格.shp not found). "
+                "Use split_strategy='random'."
+            )
+        if holdout_district is None:
+            raise ValueError("holdout_district must be specified when split_strategy='district'.")
+        train_mask, validation_mask = _district_masks(districts, holdout_district)
+    else:
+        train_mask, validation_mask = _training_masks(len(merged), validation_fraction, seed)
+
     train_indices = train_mask.numpy()
     feature_array = feature_values.to_numpy(dtype="float32", copy=True)
     target_array = target_values.to_numpy(dtype="float32", copy=True)
@@ -356,7 +623,6 @@ def load_shenzhen_vitality_data(
     features = (feature_array - feature_mean) / feature_scale
     vitality_scaled = (target_log_array - target_mean) / target_scale
 
-    block_id_order = merged["Block_ID"].to_numpy(dtype="int64", copy=True)
     edge_index          = _build_spatial_edges(data_dir, block_id_order)
     edge_index_mobility = _build_knn_mobility_edges(data_dir, block_id_order, k=30)
 
@@ -376,6 +642,7 @@ def load_shenzhen_vitality_data(
         target_scale=torch.from_numpy(target_scale.astype("float32")),
         edge_index=edge_index,
         edge_index_mobility=edge_index_mobility,
+        districts=districts,
     )
 
 
@@ -457,9 +724,9 @@ def build_config(
         "predicted_vitality":        "environment/predicted_vitality",
         "predicted_vitality_scaled": "environment/predicted_vitality_scaled",
     }
-    # Local softmax with k-NN graph does not improve over global softmax
-    # without OD flow data to constrain routing.  Edge index is precomputed
-    # and stored for future use when OD data becomes available.
+    # Local softmax requires real OD origin-destination pairs to work correctly.
+    # High-vitality attractors draw population city-wide, not just from 30 neighbours;
+    # restricting routing to a 2km k-NN graph consistently hurts the top tier.
 
     return {
         "simulation_metadata": {
@@ -473,6 +740,7 @@ def build_config(
             "num_demo_groups": N_DEMO_GROUPS,
             "num_targets": len(dataset.target_names),
             "hidden_dim": hidden_dim,
+            "temporal_rank": 8,
             "num_episodes": 1,
             "num_steps_per_episode": 1,
             "num_substeps_per_step": 1,
@@ -506,7 +774,7 @@ def build_config(
                         "move_policy": {
                             "generator": "MovePolicy",
                             "input_variables": move_policy_inputs,
-                            "output_variables": ["p_home", "attract_logits"],
+                            "output_variables": ["p_home", "attract_logits", "block_log_scale"],
                             "arguments": None,
                         }
                     }

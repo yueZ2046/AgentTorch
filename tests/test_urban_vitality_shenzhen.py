@@ -105,6 +105,7 @@ def test_gradients_flow_to_policy_parameters(tmp_path):
     move_policy = runner.initializer.policy_function["0"]["residents"]["move_policy"]
     assert move_policy.home_logits.grad is not None
     assert move_policy.attract_net[0].weight.grad is not None
+    assert move_policy.scale_net.weight.grad is not None
 
 
 def test_spatial_network_disabled_without_shapefile(tmp_path):
