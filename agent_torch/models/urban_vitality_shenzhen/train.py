@@ -57,6 +57,61 @@ def _masked_metrics(prediction, target, mask) -> Dict:
         "corr":       corr,
         "mae_by_tier": tier_mae,
         "slot_mae":    slot_mae,
+        "rank":        _rank_metrics(pred_m, tgt_m),
+    }
+
+
+
+
+def _rank_metrics(pred_m: torch.Tensor, tgt_m: torch.Tensor) -> Dict:
+    """Block-level ranking metrics on mean 48-slot vitality."""
+    pred_rank = pred_m.mean(dim=1).detach().cpu().numpy()
+    tgt_rank = tgt_m.mean(dim=1).detach().cpu().numpy()
+    n = len(tgt_rank)
+    if n < 2 or np.std(pred_rank) < 1e-9 or np.std(tgt_rank) < 1e-9:
+        return {
+            "spearman": float("nan"),
+            "kendall": float("nan"),
+            "pairwise_accuracy": float("nan"),
+            "topk_hit_rate": {},
+        }
+
+    try:
+        from scipy.stats import kendalltau, spearmanr
+        spearman = float(spearmanr(tgt_rank, pred_rank).statistic)
+        kendall = float(kendalltau(tgt_rank, pred_rank).statistic)
+    except Exception:
+        obs_order = pd.Series(tgt_rank).rank(method="average").to_numpy()
+        pred_order = pd.Series(pred_rank).rank(method="average").to_numpy()
+        spearman = float(np.corrcoef(obs_order, pred_order)[0, 1])
+        kendall = float("nan")
+
+    correct = 0
+    total = 0
+    for i in range(n):
+        d_obs = tgt_rank[i + 1:] - tgt_rank[i]
+        d_pred = pred_rank[i + 1:] - pred_rank[i]
+        mask = d_obs != 0
+        correct += int(((d_obs[mask] > 0) == (d_pred[mask] > 0)).sum())
+        total += int(mask.sum())
+
+    topk = {}
+    for k in [10, 20, 50, 100]:
+        if n >= k:
+            obs_top = set(np.argsort(tgt_rank)[-k:])
+            pred_top = set(np.argsort(pred_rank)[-k:])
+            topk[f"top{k}"] = len(obs_top & pred_top) / k
+    for pct in [0.10, 0.20, 0.25]:
+        k = max(1, int(round(n * pct)))
+        obs_top = set(np.argsort(tgt_rank)[-k:])
+        pred_top = set(np.argsort(pred_rank)[-k:])
+        topk[f"top{int(pct * 100)}pct"] = len(obs_top & pred_top) / k
+
+    return {
+        "spearman": spearman,
+        "kendall": kendall,
+        "pairwise_accuracy": correct / total if total else float("nan"),
+        "topk_hit_rate": topk,
     }
 
 
@@ -111,6 +166,76 @@ def run_baselines(dataset) -> Dict:
     }
 
     return results
+
+
+
+
+def _masked_mae(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+    if not bool(mask.any()):
+        return float("nan")
+    return float((prediction[mask] - target[mask]).abs().mean().item())
+
+
+def _feature_group_indices(feature_names: List[str]) -> Dict[str, List[int]]:
+    portrait = {
+        "CZZL20_24", "CZZL25_29", "CZZL30_34", "CZZL35_39", "CZZL40_44",
+        "CZZL45_49", "CZZL50_54", "CZZL55_59", "XB1CZRK", "XB2CZRK",
+        "就业人", "CZRKMD", "FHJCZRKZSL", "JZSJD1RKSL", "JZSJD5RKSL",
+    }
+    groups = {
+        "od_flow": [],
+        "poi": [],
+        "portrait": [],
+        "building_landuse": [],
+    }
+    for i, name in enumerate(feature_names):
+        if name.startswith("od_"):
+            groups["od_flow"].append(i)
+        elif name.startswith("poi_"):
+            groups["poi"].append(i)
+        elif name in portrait:
+            groups["portrait"].append(i)
+        else:
+            groups["building_landuse"].append(i)
+    return {k: v for k, v in groups.items() if v}
+
+
+def explain_feature_groups(runner, dataset) -> pd.DataFrame:
+    """Ablate normalized feature groups to estimate validation MAE sensitivity.
+
+    Each feature group is set to 0, the training-set mean in normalized space,
+    without retraining.  Larger positive delta means the trained model relies
+    more on that group for validation accuracy.
+    """
+    dev = runner.initializer.device
+    runner.reset_state()
+    with torch.no_grad():
+        runner.step(1)
+    observed = runner.state["environment"]["observed_vitality"].detach().cpu()
+    baseline = runner.state["environment"]["predicted_vitality"].detach().cpu()
+    base_mae = _masked_mae(baseline, observed, dataset.validation_mask)
+
+    rows = []
+    for group, indices in _feature_group_indices(dataset.feature_names).items():
+        modified = dataset.features.clone()
+        modified[:, indices] = 0.0
+        runner.reset_state()
+        runner.state["environment"]["block_features"] = modified.to(dev)
+        with torch.no_grad():
+            runner.step(1)
+        pred = runner.state["environment"]["predicted_vitality"].detach().cpu()
+        mae = _masked_mae(pred, observed, dataset.validation_mask)
+        rows.append({
+            "feature_group": group,
+            "num_features": len(indices),
+            "val_mae": round(mae, 1),
+            "delta_mae": round(mae - base_mae, 1),
+        })
+
+    runner.reset_state()
+    with torch.no_grad():
+        runner.step(1)
+    return pd.DataFrame(rows).sort_values("delta_mae", ascending=False).reset_index(drop=True)
 
 
 def diagnose_errors(runner, dataset, top_n: int = 20) -> pd.DataFrame:
@@ -301,15 +426,22 @@ def train_multi_seed(
             holdout_district=holdout_district,
         )
         per_seed.append({"seed": seed, **metrics})
+        rank = metrics["validation"].get("rank", {})
         print(
             f"  val MAE={metrics['validation']['mae']:.0f}  "
             f"val RMSE={metrics['validation']['rmse']:.0f}  "
-            f"corr={metrics['validation']['corr']:.3f}"
+            f"corr={metrics['validation']['corr']:.3f}  "
+            f"spearman={rank.get('spearman', float('nan')):.3f}"
         )
 
     val_maes  = [r["validation"]["mae"]  for r in per_seed if not np.isnan(r["validation"]["mae"])]
     val_rmses = [r["validation"]["rmse"] for r in per_seed if not np.isnan(r["validation"]["rmse"])]
     val_corrs = [r["validation"]["corr"] for r in per_seed if not np.isnan(r["validation"]["corr"])]
+    val_spearmans = [
+        r["validation"].get("rank", {}).get("spearman")
+        for r in per_seed
+        if not np.isnan(r["validation"].get("rank", {}).get("spearman", float("nan")))
+    ]
 
     summary = {
         "val_mae_mean":  float(np.mean(val_maes)),
@@ -318,14 +450,66 @@ def train_multi_seed(
         "val_mae_worst": float(np.max(val_maes)),
         "val_rmse_mean": float(np.mean(val_rmses)),
         "val_corr_mean": float(np.mean(val_corrs)),
+        "val_spearman_mean": float(np.mean(val_spearmans)) if val_spearmans else float("nan"),
     }
     print(
         f"\n[multi-seed summary] "
         f"val MAE = {summary['val_mae_mean']:.0f} ± {summary['val_mae_std']:.0f}  "
         f"(best={summary['val_mae_best']:.0f}, worst={summary['val_mae_worst']:.0f})  "
-        f"corr={summary['val_corr_mean']:.3f}"
+        f"corr={summary['val_corr_mean']:.3f}  "
+        f"spearman={summary['val_spearman_mean']:.3f}"
     )
     return {"per_seed": per_seed, "summary": summary}
+
+
+
+
+def train_district_sweep(
+    districts: Optional[List[str]] = None,
+    data_dir: str = "data_shenzhen",
+    epochs: int = 400,
+    learning_rate: float = 1e-3,
+    hidden_dim: int = 128,
+    device: str = "auto",
+    cosine_lr: bool = False,
+    early_stop_patience: int = 60,
+) -> pd.DataFrame:
+    """Run one administrative-district holdout per district."""
+    if districts is None:
+        districts = ["福田区", "南山区", "罗湖区", "宝安区", "龙岗区", "龙华区", "光明区", "盐田区", "坪山区", "大鹏新区"]
+    rows = []
+    for district in districts:
+        print(f"\n[district={district}]")
+        _, dataset, metrics, _ = train_model(
+            data_dir=data_dir,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            hidden_dim=hidden_dim,
+            validation_fraction=0.2,
+            seed=42,
+            device=device,
+            cosine_lr=cosine_lr,
+            early_stop_patience=early_stop_patience,
+            split_strategy="district",
+            holdout_district=district,
+        )
+        val = metrics["validation"]
+        rank = val.get("rank", {})
+        row = {
+            "district": district,
+            "val_blocks": int(dataset.validation_mask.sum().item()),
+            "val_mae": round(val["mae"], 1),
+            "val_rmse": round(val["rmse"], 1),
+            "corr": round(val["corr"], 4),
+            "spearman": round(rank.get("spearman", float("nan")), 4),
+            "top20pct_hit": round(rank.get("topk_hit_rate", {}).get("top20pct", float("nan")), 4),
+        }
+        rows.append(row)
+        print(
+            f"  val MAE={row['val_mae']:.0f}  corr={row['corr']:.3f}  "
+            f"spearman={row['spearman']:.3f}  top20%={row['top20pct_hit']:.3f}"
+        )
+    return pd.DataFrame(rows)
 
 
 def prediction_frame(runner, dataset):

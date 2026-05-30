@@ -1,5 +1,14 @@
 # Urban Vitality Shenzhen — 进度记录
 
+## 项目定位
+
+当前模块定位为：**深圳街坊活力排序、预测与城市更新方案反事实评估工具**。
+
+- 强项：街坊活力高低排序、Top-N 候选识别、方案相对比较、时序/空间影响诊断。
+- 谨慎使用：绝对 LBS 人数预测。当前验证 MAE 约 1337，按验证集均值归一化约 30.5%。
+- 不应宣称：严格因果预测。Phase 4 输出是模型反事实估计，仍需真实方案、外部验证或准实验设计支撑因果结论。
+
+
 ## 当前最佳结果（seed=42，Phase 3）
 
 | 指标 | 数值 |
@@ -12,6 +21,9 @@
 | 超越朴素基线 | **68%** |
 | 超越 Ridge | **7%** |
 | 验证集相关系数 | 0.923 |
+| 验证集 Spearman 排序相关 | **0.940** |
+| 验证集两两排序准确率 | **0.898** |
+| Top 20% 命中率 | **0.818** |
 | 验证集中位绝对误差 | 619 |
 | 训练集 MAE | 1183 |
 | 特征数 | 174（78 静态 + 96 OD） |
@@ -29,6 +41,7 @@
 
 > ✅ 方差从 ±530 降至 ±74（−86%），seed 间浮动从 1207 缩至 172。
 > 模型性能不再依赖"有利划分"，体现真实泛化能力。
+> 排序口径下，seed=42 验证集 Spearman=0.940、Kendall=0.795、两两排序准确率=89.8%，说明当前模型更适合做排序/筛选/方案相对比较，而不是只看绝对人数误差。
 
 ### 与 Phase 2 对比
 
@@ -57,10 +70,12 @@
 
 ### Phase 1 — 验证可靠性 ✅
 
+- **排序指标**：训练输出新增 Spearman / Kendall / pairwise order accuracy / Top-K 命中率。
 - **空间分块验证**：`--split-strategy district --holdout-district <行政区>` CLI 参数
   - 可用行政区：福田区 南山区 罗湖区 宝安区 龙岗区 龙华区 光明区 盐田区 坪山区 大鹏新区
 - **强基线对比**：`--baselines` 输出 naive_mean / Ridge / GBT / MLP vs Agent 对比表
 - **高误差街坊诊断**：`--diagnose N` 输出 top-N 高误差街坊（含 district 标签）
+- **行政区外推批量验证**：`--district-sweep` 逐区 holdout 并导出 `outputs/district_sweep.csv`。
 - `ShenzhenVitalityDataset` 新增 `districts` 字段
 
 ### Phase 2 — POI 数据补全 ✅
@@ -124,12 +139,13 @@ agent_torch/models/urban_vitality_shenzhen/
 ├── __init__.py          # get_registry(), create_runner()（含 split_strategy 参数）
 ├── data.py              # 数据加载、_aggregate_od_to_blocks、build_config()
 ├── train.py             # train_model(), run_baselines(), diagnose_errors(), train_multi_seed()
-├── main.py              # CLI（--split-strategy, --holdout-district, --baselines, --diagnose）
+├── main.py              # CLI（训练、排序指标、district sweep、解释、场景比选）
+├── scenario.py          # Phase 4 方案比选 / OD feedback / CSV 导出
 └── substeps/
     ├── move.py          # MovePolicy: home_logits + spatial_attn + attract_net + scale_net
     └── aggregate.py     # AggregateVitality: log_scale + global softmax
 tests/
-└── test_urban_vitality_shenzhen.py   # 6 个测试，全部通过
+└── test_urban_vitality_shenzhen.py   # 10 个测试，全部通过
 data_shenzhen/
 ├── 街坊_数据连接.csv / 街坊_LBS统计.csv / 街坊_人口画像.csv
 ├── 街坊范围shp/
@@ -154,6 +170,18 @@ python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
   --epochs 600 --split-strategy district --holdout-district 福田区 \
   --baselines --diagnose 20
 
+# 全行政区 holdout sweep（耗时较长）
+python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
+  --epochs 600 --district-sweep
+
+# 特征组消融解释
+python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
+  --epochs 600 --explain-groups
+
+# 方案比选（需要先准备 JSON）
+python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
+  --epochs 600 --scenario-file path/to/plan.json
+
 # 运行测试
 python3.12 -m pytest tests/test_urban_vitality_shenzhen.py -v
 ```
@@ -170,14 +198,136 @@ git push github master:main
 
 > `data_shenzhen/` 和 `outputs/` 已在 `.gitignore` 中，永远不会上传。
 
+## 当前新增能力
+
+### Phase 4 — 干预场景仿真 ✅
+
+- `scenario.py` 新增方案比选 API：`ScenarioPlan` / `RenewalScheme` / `run_scenario_plan()`。
+- 支持 JSON 方案输入，场地可用 block list 或 SHP/GeoJSON 定义。
+- 支持 building / POI 特征覆盖，并输出 baseline、方案 delta、时段变化、空间溢出表。
+- OD feedback 口径已修正：默认只对目标街坊回写预测 OD，非目标街坊保留现状 OD，避免把全城 OD predictor 误差混入 spillover。
+- 缺少 OD 特征时自动降级为冻结 OD，不中断方案仿真。
+- 测试覆盖从 6 个扩展到 10 个，新增场景解析、特征覆盖、OD target-only 回写、CSV 导出测试。
+
+### 解释层 ✅
+
+- `--explain-groups` 新增特征组消融解释：将 POI / OD / 人口画像 / 建筑用地组置为训练均值，观察验证 MAE 变化。
+- 该解释是 trained-model sensitivity，不是因果贡献；用于发现模型依赖的特征组和排查异常。
+
 ## 下一步计划
 
-### Phase 4 — 干预场景仿真
+- [ ] 准备真实方案 JSON，跑通 Phase 4 全链路并人工检查输出表。
+- [ ] 对 `--district-sweep` 结果做正式记录，评估空间外推下排序是否稳定。
+- [ ] 若要追求纯预测精度，继续把 AgentTorch 与 GBT/MLP 的误差结构做分层对比。
 
-- [ ] 定义干预变量语义（增加商业体 / 公共空间 / 交通可达性）
-- [ ] 将干预参数引入模型状态
-- [ ] 构建场景对比 API（baseline vs intervention A vs intervention B）
-- [ ] 输出时序影响、空间影响、群组影响、溢出效应
+
+## 最新诊断记录（关机前）
+
+### 行政区外推正式结果（epochs=600）
+
+已运行：
+
+```bash
+python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
+  --epochs 600 --district-sweep --district-sweep-output outputs/district_sweep.csv
+```
+
+汇总结果：
+
+| 指标 | 数值 |
+|------|------|
+| 行政区 holdout 平均 MAE | 1404.6 |
+| 按街坊数加权 MAE | 1608.5 |
+| 平均 corr | 0.889 |
+| 平均 Spearman | 0.915 |
+| 按街坊数加权 Spearman | 0.899 |
+| 平均 Top20% 命中率 | 78.6% |
+
+结论：空间外推下绝对误差上升，但排序能力仍然稳定。模型可继续定位为街坊排序、Top-N 筛选和方案相对比较工具。
+
+### 南山区专项诊断
+
+已运行：
+
+```bash
+python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
+  --epochs 600 \
+  --split-strategy district \
+  --holdout-district 南山区 \
+  --diagnose 30 \
+  --baselines \
+  --output outputs/nanshan_holdout_predictions.csv
+```
+
+南山区 holdout 结果：
+
+| 模型 | val MAE |
+|------|---------|
+| naive_mean | 3843 |
+| Ridge | 1364 |
+| GBT | 870 |
+| MLP | 1072 |
+| AgentTorch | 2429 |
+
+AgentTorch 指标：corr=0.610，Spearman=0.812，Top20%=0.707。
+
+诊断结论：南山区不是数据不可预测，而是当前 AgentTorch route/attract 结构外推失稳。典型极端过预测：
+
+| Block | observed mean | predicted mean | 方向 |
+|-------|---------------|----------------|------|
+| 2721 | 862 | 62693 | 过预测 |
+| 1005 | 466 | 53592 | 过预测 |
+| 1001 | 332 | 52858 | 过预测 |
+| 1003 | 249 | 41038 | 过预测 |
+
+这些块很多并非真实高 OD/高 POI 热点，说明问题更像是 `attract_net + global softmax` 把全市 away population 错误集中到少数南山街坊。
+
+特征组消融（南山区 holdout）：
+
+| feature_group | delta_mae |
+|---------------|-----------|
+| od_flow | +1982.7 |
+| portrait | +1146.5 |
+| poi | +19.1 |
+| building_landuse | -185.2 |
+
+解释：南山区外推主要依赖 OD 和人口画像；建筑/用地组在当前结构下可能带来误导性外推。
+
+### 下一步优先任务
+
+1. 修复 attract/global-softmax 外推失稳。
+   - 给 `attract_logits` 加温度参数或显式裁剪。
+   - 目标是防止 away population 在未见行政区塌缩到少数街坊。
+
+2. 增加 entropy regularization。
+   - 对 `torch.softmax(attract_logits)` 的分布加熵约束。
+   - 先只在训练 loss 中加小权重，观察南山区极端过预测是否消失。
+
+3. 用 OD arrival profile 约束 attract 分布。
+   - 当前 OD 特征已经强解释活力，但 attract 是自由 scalar。
+   - 可尝试用 OD arrival 均值作为 attract prior，学习 residual attract。
+
+4. 保留 GBT/MLP sanity baseline。
+   - 南山区 GBT=870、MLP=1072，AgentTorch=2429。
+   - 后续结构修改必须至少显著缩小这个差距，否则 Phase 4 不应用于严肃南山方案评估。
+
+5. 修复后重新跑：
+
+```bash
+python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
+  --epochs 600 \
+  --split-strategy district \
+  --holdout-district 南山区 \
+  --diagnose 30 \
+  --baselines
+```
+
+验收标准建议：
+
+- 南山区极端过预测块消失，predicted mean 不再出现 5-6 万级低活力街坊。
+- 南山区 AgentTorch MAE 明显低于 2000，优先目标接近 Ridge 的 1364。
+- 南山区 Spearman 保持或高于 0.812。
+- 全行政区 weighted Spearman 仍保持约 0.90。
 
 ## 完整实验记录（验证集 MAE，seed=42）
 

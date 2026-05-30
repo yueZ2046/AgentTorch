@@ -5,11 +5,14 @@ import json
 
 from .train import (
     diagnose_errors,
+    explain_feature_groups,
     run_baselines,
     save_predictions,
+    train_district_sweep,
     train_model,
     train_multi_seed,
 )
+from .scenario import ScenarioPlan, list_scheme_features, run_scenario_plan
 
 
 def main():
@@ -49,9 +52,62 @@ def main():
         "--diagnose", type=int, default=0, metavar="N",
         help="Print top-N highest-error validation blocks after training (0 = off).",
     )
+    parser.add_argument(
+        "--explain-groups", action="store_true",
+        help="Run feature-group ablation after training to explain validation sensitivity.",
+    )
+    parser.add_argument(
+        "--district-sweep", action="store_true",
+        help="Run administrative-district holdout validation for all Shenzhen districts, then exit.",
+    )
+    parser.add_argument(
+        "--district-sweep-output", default="outputs/district_sweep.csv", metavar="CSV",
+        help="CSV path for --district-sweep results.",
+    )
+    # Phase 4: scenario simulation
+    parser.add_argument(
+        "--scenario-file", default=None, metavar="JSON",
+        help="Path to scenario plan JSON file. Trains model then runs scenario comparison.",
+    )
+    parser.add_argument(
+        "--scenario-output", default="outputs/scenario", metavar="DIR",
+        help="Output directory for scenario CSV exports (default: outputs/scenario).",
+    )
+    parser.add_argument(
+        "--no-od-feedback", action="store_true",
+        help="Disable OD feedback in scenario simulation (freeze OD at current values).",
+    )
+    parser.add_argument(
+        "--list-features", action="store_true",
+        help="Print available building and POI features with city-wide value ranges, then exit.",
+    )
     args = parser.parse_args()
 
+    if args.list_features:
+        from .data import load_shenzhen_vitality_data
+        ds = load_shenzhen_vitality_data(args.data_dir)
+        list_scheme_features(ds)
+        return
+
     cosine_lr = not args.no_cosine_lr
+
+    if args.district_sweep:
+        df = train_district_sweep(
+            data_dir=args.data_dir,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            hidden_dim=args.hidden_dim,
+            device=args.device,
+            cosine_lr=cosine_lr,
+        )
+        print("\n=== District Holdout Sweep ===")
+        print(df.to_string(index=False))
+        from pathlib import Path
+        out = Path(args.district_sweep_output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out, index=False, encoding="utf-8-sig")
+        print(f"district sweep → {out}")
+        return
 
     if args.seeds:
         result = train_multi_seed(
@@ -96,6 +152,18 @@ def main():
         "val:    mae={mae:.0f}  rmse={rmse:.0f}  corr={corr:.3f}  "
         "median_ae={median_ae:.0f}".format(**v)
     )
+    rank = v.get("rank", {})
+    topk = rank.get("topk_hit_rate", {})
+    if rank:
+        print(
+            "rank:   spearman={spearman:.3f}  kendall={kendall:.3f}  "
+            "pairwise={pairwise_accuracy:.3f}  top20%={top20pct:.3f}".format(
+                spearman=rank.get("spearman", float("nan")),
+                kendall=rank.get("kendall", float("nan")),
+                pairwise_accuracy=rank.get("pairwise_accuracy", float("nan")),
+                top20pct=topk.get("top20pct", float("nan")),
+            )
+        )
     if v.get("mae_by_tier"):
         tier_str = "  ".join(f"{k}={vv:.0f}" for k, vv in v["mae_by_tier"].items())
         print(f"val by tier:  {tier_str}")
@@ -116,6 +184,22 @@ def main():
         print(f"\n=== Top-{args.diagnose} Highest-Error Validation Blocks ===")
         df = diagnose_errors(runner, dataset, top_n=args.diagnose)
         print(df.to_string(index=False))
+
+    if args.explain_groups:
+        print("\n=== Feature Group Ablation (validation MAE sensitivity) ===")
+        df = explain_feature_groups(runner, dataset)
+        print(df.to_string(index=False))
+
+    if args.scenario_file:
+        print(f"\n=== Phase 4 方案比选 ===")
+        plan = ScenarioPlan.from_json(args.scenario_file)
+        result = run_scenario_plan(
+            runner, dataset, plan,
+            data_dir=args.data_dir,
+            od_feedback=not args.no_od_feedback,
+        )
+        result.print_report(dataset)
+        result.to_csv(args.scenario_output)
 
     output_path = save_predictions(runner, dataset, args.output)
     print(f"\npredictions → {output_path}")

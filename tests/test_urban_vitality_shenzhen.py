@@ -2,6 +2,16 @@ import pandas as pd
 import torch
 
 from agent_torch.models.urban_vitality_shenzhen import create_runner
+from agent_torch.models.urban_vitality_shenzhen.scenario import (
+    ODPredictor,
+    RenewalScheme,
+    ScenarioPlan,
+    SiteSpec,
+    _apply_scheme_features,
+    _resolve_site,
+    _scheme_to_normalized,
+    run_scenario_plan,
+)
 from agent_torch.models.urban_vitality_shenzhen.data import (
     DEMO_GROUPS,
     N_DEMO_GROUPS,
@@ -20,20 +30,21 @@ def _write_fixture_data_with_spatial(path):
     _write_fixture_data(path)
 
 
-def _write_fixture_data(path, *, with_portrait=False):
-    features = pd.DataFrame(
-        {
-            "Block_ID": [1, 1, 2, 3],
-            "Shape_Area": [100.0, 120.0, 200.0, 300.0],
-            "FAR": [1.0, 3.0, 2.0, 4.0],
-            "RoadLevel": ["[1]", "[1]", "[2]", "[3]"],
-            # demographic groups required for agent weight creation
-            "青少年与儿童": [100.0, 100.0, 200.0, 50.0],
-            "青年":         [300.0, 300.0, 500.0, 150.0],
-            "中年":         [400.0, 400.0, 600.0, 200.0],
-            "老年":         [200.0, 200.0, 300.0, 100.0],
-        }
-    )
+def _write_fixture_data(path, *, with_portrait=False, with_od=False):
+    data = {
+        "Block_ID": [1, 1, 2, 3],
+        "Shape_Area": [100.0, 120.0, 200.0, 300.0],
+        "FAR": [1.0, 3.0, 2.0, 4.0],
+        "RoadLevel": ["[1]", "[1]", "[2]", "[3]"],
+        # demographic groups required for agent weight creation
+        "青少年与儿童": [100.0, 100.0, 200.0, 50.0],
+        "青年":         [300.0, 300.0, 500.0, 150.0],
+        "中年":         [400.0, 400.0, 600.0, 200.0],
+        "老年":         [200.0, 200.0, 300.0, 100.0],
+    }
+    if with_od:
+        data["od_mock"] = [5.0, 6.0, 20.0, 40.0]
+    features = pd.DataFrame(data)
     target_rows = []
     for block_id, base in [(1, 10.0), (2, 20.0), (3, 30.0)]:
         row = {"Block_ID": block_id}
@@ -133,3 +144,67 @@ def test_temporal_prior_encodes_day_night_pattern(tmp_path):
     p = torch.sigmoid(policy.home_logits.detach())
     # All demo groups: p_home at 2am (slot 2) > p_home at 1pm (slot 13)
     assert (p[:, 2] > p[:, 13]).all(), "Prior should have higher p_home at night than midday"
+
+
+
+def test_scenario_resolves_block_site_spec():
+    site = SiteSpec(blocks=[{"block_id": 1, "coverage": 0.25}, {"block_id": 2}])
+    assert _resolve_site(site, data_dir="unused") == {1: 0.25, 2: 1.0}
+
+
+def test_scheme_normalization_and_coverage_application(tmp_path, capsys):
+    _write_fixture_data(tmp_path)
+    dataset = load_shenzhen_vitality_data(tmp_path, validation_fraction=0.0)
+    scheme = RenewalScheme(
+        name="test",
+        building={"FAR": 6.0, "missing_feature": 1.0},
+    )
+
+    norm = _scheme_to_normalized(
+        scheme, dataset.feature_names, dataset.feature_mean, dataset.feature_scale
+    )
+    out = capsys.readouterr().out
+    assert "missing_feature" in out
+    far_idx = dataset.feature_names.index("FAR")
+    assert set(norm) == {far_idx}
+
+    modified = _apply_scheme_features(dataset.features, norm, [0], [0.5])
+    expected = dataset.features[0, far_idx] * 0.5 + torch.tensor(norm[far_idx]) * 0.5
+    assert torch.isclose(modified[0, far_idx], expected)
+    assert torch.isclose(modified[1, far_idx], dataset.features[1, far_idx])
+
+
+def test_od_feedback_updates_only_target_blocks(tmp_path):
+    _write_fixture_data(tmp_path, with_od=True)
+    dataset = load_shenzhen_vitality_data(tmp_path, validation_fraction=0.0)
+    od = ODPredictor().fit(dataset)
+    far_idx = dataset.feature_names.index("FAR")
+    od_idx = dataset.feature_names.index("od_mock")
+
+    modified = dataset.features.clone()
+    modified[0, far_idx] = modified[0, far_idx] + 5.0
+    result = od.predict_od_for_targets(dataset.features, modified, [0])
+
+    assert not torch.isclose(result[0, od_idx], dataset.features[0, od_idx])
+    assert torch.allclose(result[1:, od_idx], dataset.features[1:, od_idx])
+
+
+def test_run_scenario_plan_exports_expected_csvs(tmp_path):
+    _write_fixture_data(tmp_path)
+    runner, dataset = create_runner(tmp_path, hidden_dim=8, validation_fraction=0.0)
+    plan = ScenarioPlan(
+        plan_name="fixture plan",
+        site=SiteSpec(blocks=[{"block_id": 1, "coverage": 1.0}]),
+        schemes=[RenewalScheme(name="scheme_a", building={"FAR": 5.0})],
+    )
+
+    result = run_scenario_plan(runner, dataset, plan, data_dir=tmp_path, od_feedback=True)
+    assert result.baseline.shape == (dataset.num_blocks, 48)
+    assert result.schemes["scheme_a"].shape == (dataset.num_blocks, 48)
+
+    out_dir = tmp_path / "scenario_out"
+    result.to_csv(out_dir)
+    assert (out_dir / "baseline_vitality.csv").exists()
+    delta = pd.read_csv(out_dir / "delta_scheme_a.csv")
+    assert list(delta.columns[:2]) == ["block_id", "t0"]
+    assert len(delta) == dataset.num_blocks
