@@ -158,6 +158,18 @@ python3.12 -m agent_torch.models.urban_vitality_shenzhen.main \
 python3.12 -m pytest tests/test_urban_vitality_shenzhen.py -v
 ```
 
+## 推送到 GitHub
+
+- Remote：`github → git@github.com:yueZ2046/AgentTorch.git`
+- SSH 密钥：`~/.ssh/id_ed25519_github`（GitHub 账号内名称：4agenttorch）
+- SSH config：`~/.ssh/config` 已配置，直接可用
+
+```bash
+git push github master
+```
+
+> `data_shenzhen/` 和 `outputs/` 已在 `.gitignore` 中，永远不会上传。
+
 ## 下一步计划
 
 ### Phase 4 — 干预场景仿真
