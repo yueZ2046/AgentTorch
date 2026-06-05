@@ -49,6 +49,7 @@ from .scenario import ScenarioPlan, list_scheme_features, run_scenario_plan
 
 
 def main():
+    """命令行入口：解析参数并按选定模式运行训练、评估或方案比选。"""
     parser = argparse.ArgumentParser(description="训练深圳城市活力预测模型。")
 
     # ── 数据与输出路径 ──────────────────────────────────────────────────────

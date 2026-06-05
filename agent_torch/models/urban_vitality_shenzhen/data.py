@@ -125,10 +125,12 @@ class ShenzhenVitalityDataset:
 
     @property
     def num_blocks(self) -> int:
+        """数据集中的街坊总数（features 的行数）。"""
         return int(self.features.shape[0])
 
     @property
     def num_features(self) -> int:
+        """输入特征的维度 F（建筑 + POI + OD + 人口统计列数之和）。"""
         return int(self.features.shape[1])
 
     @property
@@ -148,6 +150,7 @@ def _canonical_block_id(values: pd.Series) -> pd.Series:
 
 
 def _training_masks(num_blocks: int, validation_fraction: float, seed: int):
+    """用固定随机种子生成训练集/验证集的布尔掩码（随机划分策略）。"""
     if not 0 <= validation_fraction < 1:
         raise ValueError("validation_fraction must be in [0, 1).")
 
