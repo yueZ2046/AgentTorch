@@ -1,3 +1,24 @@
+"""
+AgentTorch 初始化器模块
+=======================
+Initializer 负责两件事：
+  1. 从 YAML config 构建初始 state 字典（环境/智能体/对象/网络四个域）
+  2. 从 Registry 查找并实例化所有 substep 的 Observation/Policy/Transition 模块
+
+完成后 Runner 就可以调用 self.state 和 self.initializer.{observation/policy/transition}_function 了。
+
+state 的结构（由 config["state"] 决定）：
+  state = {
+      "current_step": 0,
+      "current_substep": "0",
+      "environment": { "vitality": Tensor, "block_features": Tensor, ... },
+      "agents":      { "residents": { "age_group": Tensor, ... } },
+      "objects":     { ... },
+      "network":     { ... },
+      "parameters":  nn.ParameterDict（可学习参数）
+  }
+"""
+
 import torch
 import torch.nn as nn
 import os
@@ -7,10 +28,10 @@ from agent_torch.core.helpers.general import *
 
 
 class Initializer(nn.Module):
-    """Constructs the initial simulation state and helper modules.
+    """从 config+registry 构建初始仿真状态和所有 substep 模块。
 
-    cpu: builds everything on host; cuda: enables lightweight stream utilities
-    for faster host→device transfers during initialization.
+    cpu 模式：在 host 上直接构建所有内容。
+    cuda 模式：启用多流异步传输，加速初始化时的 CPU→GPU 数据搬运。
     """
     def __init__(self, config, registry):
         super().__init__()

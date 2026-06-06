@@ -1,3 +1,17 @@
+"""
+AgentTorch 通用工具函数
+=======================
+这里是整个框架最常用的底层工具，几乎所有 substep 文件都会用到。
+
+最重要的两个函数：
+  get_var(state, "environment/vitality")
+      → 按路径读 state 中的值，等价于 state["environment"]["vitality"]
+  set_by_path(state, ["environment", "vitality"], new_tensor)
+      → 按路径写 state 中的值
+
+路径约定：用 "/" 分隔嵌套层级，与 YAML config 中的变量路径格式一致。
+"""
+
 import re
 from functools import reduce
 import operator
@@ -9,8 +23,13 @@ import pandas as pd
 
 
 def get_by_path(root, items):
-    r"""
-    Access a nested object in root by item sequence
+    """按路径列表递归读取嵌套 dict/ModuleDict 中的值。
+
+    参数：
+        root : 根对象（通常是 state 字典）
+        items: 路径列表，如 ["environment", "vitality"]
+
+    注意：如果遇到 nn.Module（非 ModuleDict），会调用其 forward()。
     """
     property_obj = reduce(operator.getitem, items, root)
     if isinstance(property_obj, nn.ModuleDict):
@@ -22,17 +41,26 @@ def get_by_path(root, items):
 
 
 def get_var(state, var):
-    """
-    Retrieves a value from the current state of the model.
+    """substep 代码中读取 state 变量的标准方式。
+
+    用法：
+        features = get_var(state, self.input_variables["block_features"])
+        # 等价于 state["environment"]["block_features"]
+        # 其中 input_variables["block_features"] = "environment/block_features"
     """
     return get_by_path(state, re.split("/", var))
 
 
 def set_by_path(root, items, value):
-    r"""Set a value in a nested object in root by item sequence"""
+    """按路径列表递归写入嵌套 dict 中的值。
+
+    由 Controller.progress() 调用，将 Transition 的返回值写回 state。
+    注意：对 nn.ModuleDict 写入会断开梯度（框架已知限制）。
+    """
     val_obj = get_by_path(root, items[:-1])
 
     if isinstance(val_obj, nn.ModuleDict):
+        # 已知问题：通过 ModuleDict 写入会破坏梯度图
         print("set_by_path on nn.ModuleDict breaks gradient currently!")
         val_obj[items[-1]].param.data.copy_(value)
         val_obj[items[-1]].param.requires_grad = value.requires_grad

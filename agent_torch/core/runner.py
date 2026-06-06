@@ -1,3 +1,27 @@
+"""
+AgentTorch 运行器模块
+====================
+Runner 是仿真的"总指挥"，也是用户代码最终调用的入口。
+
+典型用法（训练循环）：
+    runner = Runner(config, registry)
+    runner.init()                 # 构建 state，实例化所有 substep 模块
+    for epoch in range(N):
+        runner.reset_state()      # 重置 state，但保留可学习参数（不重建模块）
+        runner.step()             # 跑完一个 episode 的所有 step
+        loss = compute_loss(runner.state_trajectory)
+        loss.backward()
+        optimizer.step()
+
+关键区别：
+  reset()       → 完全重建（重新调用 Initializer，会重建 substep 模块，丢失梯度）
+  reset_state() → 只重置 state 张量，substep 模块及其可学习参数保持不动（训练用）
+
+state_trajectory：
+  每个 substep 结束后，state 被 to_cpu() 拷贝一份存入 state_trajectory。
+  形状：[ [state_after_substep0, state_after_substep1, ...], ... ]（按 step 分组）
+"""
+
 import torch
 import torch.nn as nn
 import types
@@ -8,10 +32,10 @@ from agent_torch.core.helpers import to_cpu
 
 
 class Runner(nn.Module):
-    """Orchestrates step/substep execution and trajectory recording.
+    """仿真主循环，调度 observe→act→progress 并记录轨迹快照。
 
-    this central loop calls observe → act → progress per substep and records
-    snapshots with a cost‑bounded strategy on cuda.
+    CPU 模式：走 _step_cpu_base，每个 substep 结束后直接 to_cpu 存快照。
+    CUDA 模式：走 _step_gpu_optimized，使用内存池、异步流等优化减少 GPU→CPU 传输。
     """
     def __init__(self, config, registry) -> None:
         super().__init__()
