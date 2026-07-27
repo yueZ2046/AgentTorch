@@ -1,7 +1,11 @@
+import sys
+
 import pandas as pd
+import pytest
 import torch
 
 from agent_torch.models.urban_vitality_shenzhen import create_runner
+from agent_torch.models.urban_vitality_shenzhen import main as shenzhen_cli
 from agent_torch.models.urban_vitality_shenzhen.scenario import (
     ODPredictor,
     RenewalScheme,
@@ -62,6 +66,16 @@ def _write_fixture_data(path, *, with_portrait=False, with_od=False):
         pd.DataFrame(portrait_rows).to_csv(
             path / "街坊_人口画像.csv", index=False, encoding="utf-8-sig"
         )
+
+
+def test_cli_help_renders_literal_percent(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["urban-vitality-shenzhen", "--help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        shenzhen_cli.main()
+
+    assert exc_info.value.code == 0
+    assert "20%" in capsys.readouterr().out
 
 
 def test_loader_builds_dataset_with_demo_weights(tmp_path):

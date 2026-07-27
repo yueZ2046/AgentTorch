@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=128,
                         help="attract_net 隐藏层维度")
     parser.add_argument("--validation-fraction", type=float, default=0.2,
-                        help="随机划分时验证集占比（0.2 = 20%）")
+                        help="随机划分时验证集占比（0.2 = 20%%）")
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子（控制数据划分和参数初始化）")
     parser.add_argument("--device", default="auto",
